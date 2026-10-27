@@ -1,0 +1,276 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Charity Event Calendar - Full-Stack AWS CloudFormation Infrastructure (ALB, ASG, RDS, Secrets Manager, IAM)'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC ID (Choose default VPC if using AWS Academy Learner Lab)
+  
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Select at least two subnets in different Availability Zones for High Availability
+
+  DbUsername:
+    Type: String
+    Default: charityadmin
+    Description: Amazon RDS MySQL Master Username
+
+  DbPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: Amazon RDS MySQL Master Password (min 8 chars)
+
+  RepositoryUrl:
+    Type: String
+    Description: Public HTTPS Git repository URL containing this application (for example, https://github.com/account/charity-event-calendar.git)
+    AllowedPattern: '^https://[A-Za-z0-9._/-]+\\.git$'
+    ConstraintDescription: must be a public HTTPS Git repository URL ending in .git
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI
+
+Resources:
+  # ============================================================================
+  # 1. AWS Secrets Manager Secret for RDS Database Credentials
+  # ============================================================================
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/rds-credentials'
+      Description: Database credentials for Charity Event Calendar application
+      SecretString: !Sub |
+        {
+          "engine": "mysql",
+          "host": "${DatabaseInstance.Endpoint.Address}",
+          "port": ${DatabaseInstance.Endpoint.Port},
+          "dbname": "charity_calendar",
+          "username": "${DbUsername}",
+          "password": "${DbPassword}"
+        }
+
+  # ============================================================================
+  # 2. IAM Role & Instance Profile for EC2
+  # ============================================================================
+  Ec2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'CharityCalendar-Ec2Role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ec2.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Policies:
+        - PolicyName: ReadDatabaseSecrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                  - 'secretsmanager:DescribeSecret'
+                Resource: !Ref DatabaseSecret
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref Ec2InstanceRole]
+
+  # ============================================================================
+  # 3. Security Groups (Tiered Isolation)
+  # ============================================================================
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTP entry point for Application Load Balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  Ec2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EC2 application instances allowing inbound HTTP only from ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  RdsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MySQL database tier allowing inbound only from EC2 app tier
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref Ec2SecurityGroup
+
+  # ============================================================================
+  # 4. Amazon RDS for MySQL Database
+  # ============================================================================
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnets for Charity Event Calendar database
+      SubnetIds: !Ref SubnetIds
+
+  DatabaseInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub 'charity-calendar-rds-${AWS::StackName}'
+      AllocatedStorage: 20
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      MasterUsername: !Ref DbUsername
+      MasterUserPassword: !Ref DbPassword
+      DBName: charity_calendar
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref RdsSecurityGroup]
+      PubliclyAccessible: false
+      DeleteAutomatedBackups: true
+      SkipFinalSnapshot: true
+
+  # ============================================================================
+  # 5. Application Load Balancer & Target Group
+  # ============================================================================
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub 'charity-alb-${AWS::StackName}'
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref SubnetIds
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  AlbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub 'charity-tg-${AWS::StackName}'
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: instance
+      HealthCheckPath: /health.php
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+
+  AlbHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AlbTargetGroup
+
+  # ============================================================================
+  # 6. EC2 Launch Template & Auto Scaling Group
+  # ============================================================================
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub 'charity-launch-template-${AWS::StackName}'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: t3.micro
+        IamInstanceProfile:
+          Arn: !GetAtt Ec2InstanceProfile.Arn
+        SecurityGroupIds: [!Ref Ec2SecurityGroup]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            dnf update -y
+            dnf install -y httpd git jq mariadb105 php php-cli php-mysqlnd php-pdo php-json php-mbstring php-xml php-curl
+            
+            # Setup Apache VirtualHost
+            cat << 'EOF' > /etc/httpd/conf.d/charity.conf
+            <Directory "/var/www/html">
+                Options -Indexes +FollowSymLinks
+                AllowOverride All
+                Require all granted
+            </Directory>
+            EOF
+
+            # Deploy application code from the public repository supplied at stack creation.
+            cd /var/www/html
+            git clone --depth 1 "${RepositoryUrl}" /tmp/app
+            cp -a /tmp/app/. /var/www/html/
+
+            # Configure environment
+            cat << 'EOF' > /var/www/html/.env
+            APP_NAME="Charity Event Calendar"
+            APP_ENV=production
+            APP_DEBUG=false
+            USE_AWS_SECRETS=true
+            AWS_REGION=${AWS::Region}
+            AWS_SECRETS_NAME=${DatabaseSecret}
+            SESSION_SECURE_COOKIE=false
+            EOF
+
+            chown -R apache:apache /var/www/html
+            chmod 600 /var/www/html/.env
+
+            # The schema is safe to apply repeatedly; seed statements are idempotent.
+            # Wait for the RDS endpoint and Secrets Manager value before importing.
+            for attempt in $(seq 1 30); do
+              SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id '${DatabaseSecret}' --region '${AWS::Region}' --query SecretString --output text 2>/dev/null || true)
+              if [ -n "$SECRET_JSON" ]; then
+                DB_HOST=$(echo "$SECRET_JSON" | jq -r '.host')
+                DB_USER=$(echo "$SECRET_JSON" | jq -r '.username')
+                DB_PASS=$(echo "$SECRET_JSON" | jq -r '.password')
+                DB_NAME=$(echo "$SECRET_JSON" | jq -r '.dbname')
+                if MYSQL_PWD="$DB_PASS" mysql --connect-timeout=5 -h "$DB_HOST" -u "$DB_USER" "$DB_NAME" < /var/www/html/database/schema.sql; then
+                  MYSQL_PWD="$DB_PASS" mysql --connect-timeout=5 -h "$DB_HOST" -u "$DB_USER" "$DB_NAME" < /var/www/html/database/seed.sql
+                  break
+                fi
+              fi
+              sleep 10
+            done
+
+            systemctl enable httpd
+            systemctl restart httpd
+
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub 'charity-asg-${AWS::StackName}'
+      VPCZoneIdentifier: !Ref SubnetIds
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      MinSize: '1'
+      DesiredCapacity: '2'
+      MaxSize: '3'
+      TargetGroupARNs: [!Ref AlbTargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 180
+
+Outputs:
+  ApplicationUrl:
+    Description: Public URL of the Charity Event Calendar via Application Load Balancer
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+  
+  RdsEndpoint:
+    Description: Amazon RDS MySQL Database Endpoint
+    Value: !GetAtt DatabaseInstance.Endpoint.Address
+
+  SecretsManagerArn:
+    Description: AWS Secrets Manager Secret ARN
+    Value: !Ref DatabaseSecret
